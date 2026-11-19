@@ -3,6 +3,8 @@
 # (C) 2026 ghzserg https://github.com/ghzserg/zmod
 #
 # Wi-Fi watchdog. Started by wifi.sh once zmod manages Wi-Fi; exits when it no longer does.
+# Runs from busybox crond (one check a minute, no resident shell: ~0.3 MB less RAM);
+# without crond, as a loop.
 # wifi_reconnect.sh only reacts to wpa_supplicant events, so it cannot help when there is
 # no event at all (no association after boot, a stuck link). Once a minute this checks wlan0
 # and repairs only the broken step:
@@ -28,6 +30,7 @@ LOG=$LOGDIR/wifi_watchdog.log
 STATE=/run/wifi_watchdog.state
 PIDFILE=/run/wifi_watchdog.pid
 BOOTCOPY=/run/wifi_watchdog.bootlog
+CRON_DIR=/run/wifi_watchdog.cron
 INTERVAL=60
 FIRST_DELAY=120
 SCAN_WAIT=8
@@ -39,15 +42,16 @@ log() {
     echo "$(date '+%F %T') $*" >> "$LOG"
 }
 
-# assoc_bad gw_bad dhcp_bad last_restart gap gw_seen wpa_pid
+# assoc_bad gw_bad dhcp_bad last_restart gap gw_seen wpa_pid gw_mute last_rx
+# (all of it in the file: under cron every check is a new process)
 load_state() {
-    assoc_bad=0; gw_bad=0; dhcp_bad=0; last_restart=0; gap=$GAP_MIN; gw_seen=0; wpa_pid=0
-    [ -f "$STATE" ] && read -r assoc_bad gw_bad dhcp_bad last_restart gap gw_seen wpa_pid < "$STATE"
-    case "$assoc_bad.$gw_bad.$dhcp_bad.$last_restart.$gap.$gw_seen.$wpa_pid" in
-        *[!0-9.]*|*..*|.*|*.) assoc_bad=0; gw_bad=0; dhcp_bad=0; last_restart=0; gap=$GAP_MIN; gw_seen=0; wpa_pid=0 ;;
+    assoc_bad=0; gw_bad=0; dhcp_bad=0; last_restart=0; gap=$GAP_MIN; gw_seen=0; wpa_pid=0; gw_mute=0; last_rx=0
+    [ -f "$STATE" ] && read -r assoc_bad gw_bad dhcp_bad last_restart gap gw_seen wpa_pid gw_mute last_rx < "$STATE"
+    case "$assoc_bad.$gw_bad.$dhcp_bad.$last_restart.$gap.$gw_seen.$wpa_pid.$gw_mute.$last_rx" in
+        *[!0-9.]*|*..*|.*|*.) assoc_bad=0; gw_bad=0; dhcp_bad=0; last_restart=0; gap=$GAP_MIN; gw_seen=0; wpa_pid=0; gw_mute=0; last_rx=0 ;;
     esac
 }
-save_state() { echo "$assoc_bad $gw_bad $dhcp_bad $last_restart $gap $gw_seen $wpa_pid" > "$STATE"; }
+save_state() { echo "$assoc_bad $gw_bad $dhcp_bad $last_restart $gap $gw_seen $wpa_pid $gw_mute $last_rx" > "$STATE"; }
 reset_counters() { assoc_bad=0; gw_bad=0; dhcp_bad=0; gw_seen=0; gw_mute=0; }
 
 uptime_s() { cut -d. -f1 /proc/uptime; }
@@ -224,6 +228,21 @@ check_once() {
 
 case "$1" in
     start)
+        if command -v crond >/dev/null; then
+            # a stale pidfile may name a reused PID: trust it only if it is really our crond
+            p=$(cat $CRON_DIR/pid 2>/dev/null)
+            [ -n "$p" ] && tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q "$CRON_DIR" && exit 0
+            # a loop left by a zmod update without reboot
+            p=$(cat $PIDFILE 2>/dev/null)
+            [ -n "$p" ] && tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q "wifi_watchdog.sh run" && kill $p
+            rm -f "$STATE" $CRON_DIR/pid
+            mkdir -p $CRON_DIR
+            echo "* * * * * PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/sh $ZSHELL/wifi_watchdog.sh once >/dev/null 2>&1" > $CRON_DIR/root
+            # -l 9: no syslog line per run
+            start-stop-daemon -S -q -b -m -p $CRON_DIR/pid -N 10 -x "$(command -v crond)" -- -f -c $CRON_DIR -l 9
+            log "started (cron)"
+            exit 0
+        fi
         # a stale pidfile may name a reused PID: trust it only if it is really us
         p=$(cat $PIDFILE 2>/dev/null)
         [ -n "$p" ] && tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q "wifi_watchdog.sh run" && exit 0
@@ -231,7 +250,18 @@ case "$1" in
         start-stop-daemon -S -q -b -m -p $PIDFILE -N 10 -a /bin/sh -- $ZSHELL/wifi_watchdog.sh run
         ;;
     once)
-        check_once
+        # the first check FIRST_DELAY s after boot, as in the loop
+        read -r up _ < /proc/uptime
+        [ "${up%%.*}" -lt $FIRST_DELAY ] && exit 0
+        # runs do not overlap: busybox crond skips a job whose previous run is still going
+        check_once && exit 0
+        # save_variables rewrites variables.cfg in place: re-check before giving up
+        sleep 5; zmod_manages_wifi && exit 0
+        p=$(cat $CRON_DIR/pid 2>/dev/null)
+        if [ -n "$p" ] && tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q "$CRON_DIR"; then
+            kill $p
+            log "stopped: zmod no longer manages Wi-Fi"
+        fi
         ;;
     run)
         trap 'rm -f $PIDFILE' EXIT
